@@ -1,0 +1,415 @@
+*** Begin Patch
+*** Add File: app/Services/TaskScoringService.php
+@@
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Str;
+use Carbon\Carbon;
+
+class TaskScoringService
+{
+    public function evaluate(?string $title, ?string $description, ?string $dueDate): array
+    {
+        $score = 0;
+        $factors = [];
+
+        // Default values if inputs are missing
+        $description = $description ?? '';
+        $dueDate = $dueDate ?? now()->addDays(7)->toDateString();
+
+        // 1) Urgency calculation
+        $urgencyMultiplier = 1.00;
+        try {
+            $now = Carbon::now()->timezone(config('app.timezone'))->startOfDay();
+            $due = Carbon::parse($dueDate)->startOfDay();
+            $days = $now->diffInDays($due, false);
+
+            if ($days <= 0) {
+                $score += 40;
+                $urgencyMultiplier = 1.25;
+                $factors['urgency'] = 'Hoy o pasado: +40, x1.25';
+            } elseif ($days <= 2) {
+                $score += 30;
+                $urgencyMultiplier = 1.15;
+                $factors['urgency'] = '1-2 días: +30, x1.15';
+            } elseif ($days <= 5) {
+                $score += 15;
+                $urgencyMultiplier = 1.08;
+                $factors['urgency'] = '3-5 días: +15, x1.08';
+            } else {
+                $score += 0;
+                $urgencyMultiplier = 1.00;
+                $factors['urgency'] = '>5 días: +0, x1.00';
+            }
+        } catch (\Exception $e) {
+            $factors['urgency'] = 'Error parsing date';
+        }
+
+        // 2) Length complexity
+        $words = str_word_count($description);
+        if ($words > 100) {
+            $score += 35;
+            $factors['length'] = '>100 palabras: +35';
+        } elseif ($words > 50) {
+            $score += 20;
+            $factors['length'] = '>50 palabras: +20';
+        } elseif ($words > 20) {
+            $score += 10;
+            $factors['length'] = '>20 palabras: +10';
+        } else {
+            $factors['length'] = '≤20 palabras: +0';
+        }
+
+        // 3) Keywords analysis
+        $textLower = Str::lower($description . ' ' . ($title ?? ''));
+
+        $highKeywords = ['deploy', 'migración', 'docker', 'integrar', 'autenticación', 'api', 'seguridad', 'optimizar', 'refactor', 'producción', 'kubernetes', 'azure', 'firebase', 'nginx', 'bug', 'incidente'];
+        $mediumKeywords = ['investigar', 'configurar', 'modelo', 'consulta', 'diagrama', 'endpoint', 'testing'];
+        $lowKeywords = ['reunión', 'leer', 'documentar', 'nota'];
+
+        $highCount = 0;
+        foreach ($highKeywords as $kw) {
+            if (Str::contains($textLower, $kw)) {
+                $highCount++;
+            }
+        }
+        $highScore = min(30, $highCount * 10);
+        $score += $highScore;
+        $factors['keywords_high'] = "Alta prioridad: +{$highScore}";
+
+        $mediumCount = 0;
+        foreach ($mediumKeywords as $kw) {
+            if (Str::contains($textLower, $kw)) {
+                $mediumCount++;
+            }
+        }
+        $mediumScore = min(18, $mediumCount * 6);
+        $score += $mediumScore;
+        $factors['keywords_medium'] = "Media prioridad: +{$mediumScore}";
+
+        $lowCount = 0;
+        foreach ($lowKeywords as $kw) {
+            if (Str::contains($textLower, $kw)) {
+                $lowCount++;
+            }
+        }
+        $lowScore = min(9, $lowCount * 3);
+        if ($lowCount > 0 && $highCount === 0 && $mediumCount === 0) {
+            $lowScore -= 3;
+        }
+        $score += $lowScore;
+        $factors['keywords_low'] = "Baja prioridad: +{$lowScore}";
+
+        // 4) Time estimate parsing
+        if (preg_match('/(\d+)\s*(h|hr|hora|horas)/i', $description, $matches)) {
+            $hours = (int)$matches[1];
+            $timeBonus = min(20, 5 * $hours);
+            $score += $timeBonus;
+            $factors['time_estimate'] = "{$hours}h: +{$timeBonus}";
+        } elseif (preg_match('/(\d+)\s*(min|m)/i', $description, $matches)) {
+            $score += 5;
+            $factors['time_estimate'] = "Minutos: +5";
+        } else {
+            $factors['time_estimate'] = 'No detectado';
+        }
+
+        // 5) Map score to difficulty
+        if ($score >= 60) {
+            $difficulty = 3;
+        } elseif ($score >= 30) {
+            $difficulty = 2;
+        } else {
+            $difficulty = 1;
+        }
+
+        // 6) Calculate points
+        $basePoints = match ($difficulty) {
+            1 => 10,
+            2 => 20,
+            3 => 40,
+            default => 10,
+        };
+
+        $points = (int)($basePoints * $urgencyMultiplier);
+        $lengthBonus = (int)floor($words / 15) * 2;
+        $points += $lengthBonus;
+        $points = max(5, min(100, $points));
+
+        return [
+            'difficulty' => $difficulty,
+            'points' => $points,
+            'score' => $score,
+            'factors' => $factors,
+        ];
+    }
+}
+@@
+*** Update File: app/Http/Controllers/TaskController.php
+@@
+--- a/app/Http/Controllers/TaskController.php
++++ b/app/Http/Controllers/TaskController.php
+@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
+ use App\Models\User;
+ use App\Models\Task;
+ use App\Models\TaskCompletion;
++use App\Services\TaskScoringService;
+ use Illuminate\Http\Request;
+ use Illuminate\Support\Carbon;
+ use Illuminate\Support\Facades\DB;
+@@ -67,16 +68,30 @@ class TaskController extends Controller
+     // ---------- CRUD ----------
+     public function store(Request $request)
+     {
+         $user = auth()->user();
++        $auto = (bool)$request->input('auto_score', true);
+
+-        $data = $request->validate([
++        $rules = [
+             'title'       => ['required','string','max:150'],
+             'description' => ['nullable','string'],
+-            'difficulty'  => ['required','integer','in:1,2,3'],
+-            'points'      => ['required','integer','min:1'],
+             'due_date'    => ['required','date'],
+-        ]);
++        ];
++
++        if ($auto) {
++            $rules['difficulty'] = ['nullable','integer','in:1,2,3'];
++            $rules['points'] = ['nullable','integer','min:1'];
++        } else {
++            $rules['difficulty'] = ['required','integer','in:1,2,3'];
++            $rules['points'] = ['required','integer','min:1'];
++        }
++
++        $data = $request->validate($rules);
++
++        if ($auto) {
++            $result = app(TaskScoringService::class)->evaluate($data['title'] ?? null, $data['description'] ?? null, $data['due_date'] ?? null);
++            $data['difficulty'] = $result['difficulty'];
++            $data['points'] = $result['points'];
++        }
+
+         $user->tasks()->create($data);
+         return back()->with('status', 'Tarea creada.');
+@@
+*** Update File: resources/views/tasks/create.blade.php
+@@
+--- a/resources/views/tasks/create.blade.php
++++ b/resources/views/tasks/create.blade.php
+@@ -10,6 +10,11 @@
+                 <form method="POST" action="{{ route('tasks.store') }}">
+                     @csrf
+
++                    <div class="form-check form-switch mb-3">
++                        <input class="form-check-input" type="checkbox" id="auto_score" name="auto_score" value="1" checked>
++                        <label class="form-check-label" for="auto_score">Asignación automática</label>
++                    </div>
++
+                     <div class="mb-3">
+                         <label for="title" class="form-label">Título</label>
+                         <input type="text" class="form-control @error('title') is-invalid @enderror"
+@@ -34,7 +39,7 @@
+                         <div class="col-md-4 mb-3">
+                             <label for="difficulty" class="form-label">Dificultad</label>
+                             <select class="form-select @error('difficulty') is-invalid @enderror"
+-                                    id="difficulty" name="difficulty" required>
++                                    id="difficulty" name="difficulty" disabled>
+                                 <option value="1" @selected(old('difficulty', 1) == 1)>Fácil</option>
+                                 <option value="2" @selected(old('difficulty') == 2)>Media</option>
+                                 <option value="3" @selected(old('difficulty') == 3)>Difícil</option>
+@@ -48,7 +53,7 @@
+                             <label for="points" class="form-label">Puntos</label>
+                             <input type="number" class="form-control @error('points') is-invalid @enderror"
+                                    id="points" name="points" value="{{ old('points', 10) }}"
+-                                   min="1" required>
++                                   min="1" disabled>
+                             @error('points')
+                                 <div class="invalid-feedback">{{ $message }}</div>
+                             @enderror
+@@ -65,6 +70,12 @@
+                         </div>
+                     </div>
+
++                    <div class="mb-3" aria-live="polite">
++                        <strong>Preview:</strong>
++                        <span id="preview_difficulty" class="badge bg-success ms-2">Fácil</span>
++                        <span id="preview_points" class="badge bg-primary ms-1">10 puntos</span>
++                    </div>
++
+                     <div class="d-flex justify-content-between">
+                         <a href="{{ route('tasks.index') }}" class="btn btn-secondary">Cancelar</a>
+                         <button type="submit" class="btn btn-primary">Crear Tarea</button>
+@@ -73,4 +84,157 @@
+             </div>
+         </div>
+     </div>
+ </div>
++
++<script>
++(function() {
++    const autoScoreToggle = document.getElementById('auto_score');
++    const difficultySelect = document.getElementById('difficulty');
++    const pointsInput = document.getElementById('points');
++    const descriptionTextarea = document.getElementById('description');
++    const titleInput = document.getElementById('title');
++    const dueDateInput = document.getElementById('due_date');
++    const previewDifficulty = document.getElementById('preview_difficulty');
++    const previewPoints = document.getElementById('preview_points');
++
++    // Keywords (same as PHP service)
++    const highKeywords = ['deploy', 'migración', 'docker', 'integrar', 'autenticación', 'api', 'seguridad', 'optimizar', 'refactor', 'producción', 'kubernetes', 'azure', 'firebase', 'nginx', 'bug', 'incidente'];
++    const mediumKeywords = ['investigar', 'configurar', 'modelo', 'consulta', 'diagrama', 'endpoint', 'testing'];
++    const lowKeywords = ['reunión', 'leer', 'documentar', 'nota'];
++
++    function calculateScore() {
++        let score = 0;
++        const description = descriptionTextarea.value || '';
++        const title = titleInput.value || '';
++        const dueDate = dueDateInput.value;
++
++        // 1) Urgency
++        let urgencyMultiplier = 1.00;
++        if (dueDate) {
++            const now = new Date();
++            now.setHours(0, 0, 0, 0);
++            const due = new Date(dueDate);
++            due.setHours(0, 0, 0, 0);
++            const diffTime = due - now;
++            const days = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
++
++            if (days <= 0) {
++                score += 40;
++                urgencyMultiplier = 1.25;
++            } else if (days <= 2) {
++                score += 30;
++                urgencyMultiplier = 1.15;
++            } else if (days <= 5) {
++                score += 15;
++                urgencyMultiplier = 1.08;
++            } else {
++                score += 0;
++                urgencyMultiplier = 1.00;
++            }
++        }
++
++        // 2) Length
++        const words = description.split(/\s+/).filter(w => w.length > 0).length;
++        if (words > 100) {
++            score += 35;
++        } else if (words > 50) {
++            score += 20;
++        } else if (words > 20) {
++            score += 10;
++        }
++
++        // 3) Keywords
++        const textLower = (description + ' ' + title).toLowerCase();
++
++        let highCount = 0;
++        highKeywords.forEach(kw => {
++            if (textLower.includes(kw)) highCount++;
++        });
++        const highScore = Math.min(30, highCount * 10);
++        score += highScore;
++
++        let mediumCount = 0;
++        mediumKeywords.forEach(kw => {
++            if (textLower.includes(kw)) mediumCount++;
++        });
++        const mediumScore = Math.min(18, mediumCount * 6);
++        score += mediumScore;
++
++        let lowCount = 0;
++        lowKeywords.forEach(kw => {
++            if (textLower.includes(kw)) lowCount++;
++        });
++        let lowScore = Math.min(9, lowCount * 3);
++        if (lowCount > 0 && highCount === 0 && mediumCount === 0) {
++            lowScore -= 3;
++        }
++        score += lowScore;
++
++        // 4) Time estimate
++        const hoursMatch = description.match(/(\d+)\s*(h|hr|hora|horas)/i);
++        const minutesMatch = description.match(/(\d+)\s*(min|m)/i);
++
++        if (hoursMatch) {
++            const hours = parseInt(hoursMatch[1]);
++            const timeBonus = Math.min(20, 5 * hours);
++            score += timeBonus;
++        } else if (minutesMatch) {
++            score += 5;
++        }
++
++        // 5) Map to difficulty
++        let difficulty = 1;
++        if (score >= 60) {
++            difficulty = 3;
++        } else if (score >= 30) {
++            difficulty = 2;
++        }
++
++        // 6) Calculate points
++        const basePoints = difficulty === 1 ? 10 : (difficulty === 2 ? 20 : 40);
++        let points = Math.floor(basePoints * urgencyMultiplier);
++        const lengthBonus = Math.floor(words / 15) * 2;
++        points += lengthBonus;
++        points = Math.max(5, Math.min(100, points));
++
++        return { difficulty, points };
++    }
++
++    function updatePreview() {
++        const result = calculateScore();
++
++        // Update badges
++        const difficultyText = ['', 'Fácil', 'Media', 'Difícil'][result.difficulty];
++        const difficultyClass = ['', 'bg-success', 'bg-warning text-dark', 'bg-danger'][result.difficulty];
++
++        previewDifficulty.textContent = difficultyText;
++        previewDifficulty.className = 'badge ms-2 ' + difficultyClass;
++        previewPoints.textContent = result.points + ' puntos';
++
++        // If auto mode is off, update inputs
++        if (!autoScoreToggle.checked) {
++            difficultySelect.value = result.difficulty;
++            pointsInput.value = result.points;
++        }
++    }
++
++    function toggleAutoMode() {
++        const isAuto = autoScoreToggle.checked;
++
++        if (isAuto) {
++            // Disable inputs
++            difficultySelect.disabled = true;
++            pointsInput.disabled = true;
++            difficultySelect.removeAttribute('required');
++            pointsInput.removeAttribute('required');
++        } else {
++            // Enable inputs and prefill with suggestions
++            const result = calculateScore();
++            difficultySelect.value = result.difficulty;
++            pointsInput.value = result.points;
++            difficultySelect.disabled = false;
++            pointsInput.disabled = false;
++            difficultySelect.setAttribute('required', 'required');
++            pointsInput.setAttribute('required', 'required');
++        }
++    }
++
++    // Event listeners
++    autoScoreToggle.addEventListener('change', toggleAutoMode);
++    descriptionTextarea.addEventListener('input', updatePreview);
++    titleInput.addEventListener('input', updatePreview);
++    dueDateInput.addEventListener('change', updatePreview);
++
++    // Initial update
++    updatePreview();
++})();
++</script>
+ @endsection
+@@
+*** End Patch

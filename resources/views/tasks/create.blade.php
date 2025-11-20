@@ -1,13 +1,23 @@
-@extends('layouts.plain')
+@extends('layouts.app')
+
 @section('content')
-<h1>Nueva tarea</h1>
-<form method="POST" action="{{ route('tasks.store') }}">
-    @csrf
-    <label>Título <input name="title" value="{{ old('title') }}" required></label><br>
-    <label>Descripción <textarea name="description">{{ old('description') }}</textarea></label><br>
-    <label>Dificultad <input type="number" name="difficulty" min="1" max="5" value="{{ old('difficulty',1) }}"></label><br>
-    <label>Puntos <input type="number" name="points" min="1" value="{{ old('points',10) }}"></label><br>
-    <label>Fecha límite <input type="date" name="due_date" value="{{ old('due_date', now()->toDateString()) }}" required></label><br>
-    <button type="submit">Guardar</button>
-</form>
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-body text-center py-5">
+                <h1 class="mb-3">Nueva Tarea</h1>
+                <p class="text-muted mb-4">Usa el botón para crear una tarea rápidamente.</p>
+                <button class="btn btn-primary btn-lg"
+                        data-bs-toggle="modal" data-bs-target="#modalCreateTask">
+                    + Agregar tarea
+                </button>
+                <div class="mt-3">
+                    <a href="{{ route('tasks.index') }}" class="btn btn-link">Ver todas las tareas</a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+@include('tasks._create_modal')
 @endsection

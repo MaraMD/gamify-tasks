@@ -1,0 +1,197 @@
+*** Begin Patch
+*** Add File: app/Services/TaskScoringService.php
+@@
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Str;
+use Carbon\Carbon;
+
+class TaskScoringService
+{
+    public function evaluate(?string $title, ?string $description, ?string $dueDate): array
+    {
+        $score = 0;
+        $factors = [];
+
+        // Default values if inputs are missing
+        $description = $description ?? '';
+        $dueDate = $dueDate ?? now()->addDays(7)->toDateString();
+
+        // 1) Urgency calculation
+        $urgencyMultiplier = 1.00;
+        try {
+            $now = Carbon::now()->timezone(config('app.timezone'))->startOfDay();
+            $due = Carbon::parse($dueDate)->startOfDay();
+            $days = $now->diffInDays($due, false);
+
+            if ($days <= 0) {
+                $score += 40;
+                $urgencyMultiplier = 1.25;
+                $factors['urgency'] = 'Hoy o pasado: +40, x1.25';
+            } elseif ($days <= 2) {
+                $score += 30;
+                $urgencyMultiplier = 1.15;
+                $factors['urgency'] = '1-2 días: +30, x1.15';
+            } elseif ($days <= 5) {
+                $score += 15;
+                $urgencyMultiplier = 1.08;
+                $factors['urgency'] = '3-5 días: +15, x1.08';
+            } else {
+                $score += 0;
+                $urgencyMultiplier = 1.00;
+                $factors['urgency'] = '>5 días: +0, x1.00';
+            }
+        } catch (\Exception $e) {
+            $factors['urgency'] = 'Error parsing date';
+        }
+
+        // 2) Length complexity
+        $words = str_word_count($description);
+        if ($words > 100) {
+            $score += 35;
+            $factors['length'] = '>100 palabras: +35';
+        } elseif ($words > 50) {
+            $score += 20;
+            $factors['length'] = '>50 palabras: +20';
+        } elseif ($words > 20) {
+            $score += 10;
+            $factors['length'] = '>20 palabras: +10';
+        } else {
+            $factors['length'] = '≤20 palabras: +0';
+        }
+
+        // 3) Keywords analysis
+        $textLower = Str::lower($description . ' ' . ($title ?? ''));
+
+        $highKeywords = ['deploy', 'migración', 'docker', 'integrar', 'autenticación', 'api', 'seguridad', 'optimizar', 'refactor', 'producción', 'kubernetes', 'azure', 'firebase', 'nginx', 'bug', 'incidente'];
+        $mediumKeywords = ['investigar', 'configurar', 'modelo', 'consulta', 'diagrama', 'endpoint', 'testing'];
+        $lowKeywords = ['reunión', 'leer', 'documentar', 'nota'];
+
+        $highCount = 0;
+        foreach ($highKeywords as $kw) {
+            if (Str::contains($textLower, $kw)) {
+                $highCount++;
+            }
+        }
+        $highScore = min(30, $highCount * 10);
+        $score += $highScore;
+        $factors['keywords_high'] = "Alta prioridad: +{$highScore}";
+
+        $mediumCount = 0;
+        foreach ($mediumKeywords as $kw) {
+            if (Str::contains($textLower, $kw)) {
+                $mediumCount++;
+            }
+        }
+        $mediumScore = min(18, $mediumCount * 6);
+        $score += $mediumScore;
+        $factors['keywords_medium'] = "Media prioridad: +{$mediumScore}";
+
+        $lowCount = 0;
+        foreach ($lowKeywords as $kw) {
+            if (Str::contains($textLower, $kw)) {
+                $lowCount++;
+            }
+        }
+        $lowScore = min(9, $lowCount * 3);
+        if ($lowCount > 0 && $highCount === 0 && $mediumCount === 0) {
+            $lowScore -= 3;
+        }
+        $score += $lowScore;
+        $factors['keywords_low'] = "Baja prioridad: +{$lowScore}";
+
+        // 4) Time estimate parsing
+        if (preg_match('/(\d+)\s*(h|hr|hora|horas)/i', $description, $matches)) {
+            $hours = (int)$matches[1];
+            $timeBonus = min(20, 5 * $hours);
+            $score += $timeBonus;
+            $factors['time_estimate'] = "{$hours}h: +{$timeBonus}";
+        } elseif (preg_match('/(\d+)\s*(min|m)/i', $description, $matches)) {
+            $score += 5;
+            $factors['time_estimate'] = "Minutos: +5";
+        } else {
+            $factors['time_estimate'] = 'No detectado';
+        }
+
+        // 5) Map score to difficulty
+        if ($score >= 60) {
+            $difficulty = 3;
+        } elseif ($score >= 30) {
+            $difficulty = 2;
+        } else {
+            $difficulty = 1;
+        }
+
+        // 6) Calculate points
+        $basePoints = match ($difficulty) {
+            1 => 10,
+            2 => 20,
+            3 => 40,
+            default => 10,
+        };
+
+        $points = (int)($basePoints * $urgencyMultiplier);
+        $lengthBonus = (int)floor($words / 15) * 2;
+        $points += $lengthBonus;
+        $points = max(5, min(100, $points));
+
+        return [
+            'difficulty' => $difficulty,
+            'points' => $points,
+            'score' => $score,
+            'factors' => $factors,
+        ];
+    }
+}
+@@
+*** Update File: app/Http/Controllers/TaskController.php
+@@
+--- a/app/Http/Controllers/TaskController.php
++++ b/app/Http/Controllers/TaskController.php
+@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
+ use App\Models\User;
+ use App\Models\Task;
+ use App\Models\TaskCompletion;
++use App\Services\TaskScoringService;
+ use Illuminate\Http\Request;
+ use Illuminate\Support\Carbon;
+ use Illuminate\Support\Facades\DB;
+@@ -67,16 +68,30 @@ class TaskController extends Controller
+     // ---------- CRUD ----------
+     public function store(Request $request)
+     {
+         $user = auth()->user();
++        $auto = (bool)$request->input('auto_score', false);
+
+-        $data = $request->validate([
++        $rules = [
+             'title'       => ['required','string','max:150'],
+             'description' => ['nullable','string'],
+-            'difficulty'  => ['required','integer','in:1,2,3'],
+-            'points'      => ['required','integer','min:1'],
+             'due_date'    => ['required','date'],
+-        ]);
++        ];
++
++        if ($auto) {
++            $rules['difficulty'] = ['nullable','integer','in:1,2,3'];
++            $rules['points'] = ['nullable','integer','min:1'];
++        } else {
++            $rules['difficulty'] = ['required','integer','in:1,2,3'];
++            $rules['points'] = ['required','integer','min:1'];
++        }
++
++        $data = $request->validate($rules);
++
++        if ($auto) {
++            $result = app(TaskScoringService::class)->evaluate($data['title'] ?? null, $data['description'] ?? null, $data['due_date'] ?? null);
++            $data['difficulty'] = $result['difficulty'];
++            $data['points'] = $result['points'];
++        }
+
+         $user->tasks()->create($data);
+         return back()->with('status', 'Tarea creada.');
+@@
+*** End Patch

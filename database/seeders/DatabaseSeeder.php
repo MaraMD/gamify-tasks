@@ -13,6 +13,9 @@ class DatabaseSeeder extends Seeder
 {
 public function run(): void
 {
+    // Crear usuario administrador de pruebas
+    $this->call(AdminUserSeeder::class);
+
     $user = User::factory()->create([
         'id' => 1,
         'name' => 'Demo',
@@ -21,7 +24,15 @@ public function run(): void
     ]);
 
     // Personaje inicial
-    $user->characters()->create(['name' => 'Héroe', 'xp' => 120]);
+    $user->characters()->create([
+        'name' => 'Héroe',
+        'xp' => 120,
+        'skin_hex' => '#ffffff',
+        'boxer_hex' => '#6c757d',
+        'hair_style' => 'none',
+        'hair_hex' => '#000000',
+        'eyes_hex' => '#2b2b2b',
+    ]);
 
     // Tareas random
     Task::factory()->count(12)->create(['user_id' => $user->id]);
